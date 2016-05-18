@@ -140,7 +140,7 @@
 
 -spec new() -> orswot().
 new() ->
-    {riak_dt_vclock:fresh(), ?DICT:new(), ?DICT:new()}.
+    {riak_dt_vclock:fresh(), riak_dt_vclock:fresh(), ?DICT:new(), ?DICT:new()}.
 
 %% Cleans all the elements from the set.
 -spec reset(orswot()) -> {ok, orswot()}.
@@ -157,8 +157,11 @@ reset(ORSet) ->
 %% we would never be able to add new elements, because the reset clock was
 %% never going to be descended.
 -spec reset_all(riak_dt_vclock:vclock(), orswot) -> {ok, orswot()}.
-reset_all(RClock, {Clock, _Reset, Entries, Deferred}) ->
-	NewSet = {Clock, RClock, Entries, Deferred},
+reset_all(RClock, {Clock, Reset, _Entries, _Deferred}) ->
+	NewSet = {Clock,
+			  riak_dt_vclock:merge(Reset, RClock),
+			  ?DICT:new(),
+			  ?DICT:new()},
 	{ok, NewSet}.
 
 %% @doc sets the clock in the Set to that `Clock'. Used by a
@@ -217,7 +220,7 @@ update({remove, Elem}, _Actor, {Clock, Reset, Entries, Deferred}, Ctx) ->
     %% Being asked to remove something with a context.  If we
     %% have this element, we can drop any dots it has that the
     %% Context has seen.
-    Deferred2 = defer_remove(Clock, Ctx, Elem, Deferred),
+    Deferred2 = defer_remove(Clock, Reset, Ctx, Elem, Deferred),
     case ?DICT:find(Elem, Entries) of
         {ok, ElemClock} ->
             ElemClock2 = riak_dt_vclock:subtract_dots(ElemClock, Ctx),
@@ -265,17 +268,22 @@ update({add_all, Elems}, Actor, ORSet, _Ctx) ->
 %% @TODO revist this, as it might be meaningful in some cases (for
 %% true idempotence) and we can have merges triggering updates,
 %% maybe.)
--spec defer_remove(riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), orswot_op(), deferred()) ->
-                      deferred().
-defer_remove(Clock, Ctx, Elem, Deferred) ->
-    case riak_dt_vclock:descends(Clock, Ctx) of
+-spec defer_remove(riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), riak_dt_vclock:vclock(),
+				   orswot_op(), deferred()) -> deferred().
+defer_remove(Clock, Reset, Ctx, Elem, Deferred) ->
+	case riak_dt_vclock:descends(Reset, Clock) of
+		true -> Limit = Reset;
+		false -> Limit = Clock
+	end,
+    case riak_dt_vclock:descends(Limit, Ctx) of
         %% no need to save this remove, we're done
         true -> Deferred;
         false -> ?DICT:update(Ctx,
-                                fun(Elems) ->
-                                        ordsets:add_element(Elem, Elems) end,
-                                ordsets:add_element(Elem, ordsets:new()),
-                                Deferred)
+							  fun(Elems) ->
+									  ordsets:add_element(Elem, Elems)
+							  end,
+							  ordsets:add_element(Elem, ordsets:new()),
+							  Deferred)
     end.
 
 -spec apply_ops([orswot_op], actor() | dot(), orswot()) ->

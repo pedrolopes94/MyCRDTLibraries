@@ -66,7 +66,8 @@
 %% @end
 -module(rwset).
 
--behaviour(riak_dt).
+%% Put in commentary to hide warning.
+%% -behaviour(riak_dt).
 
 -ifdef(EQC).
 -include_lib("eqc/include/eqc.hrl").
@@ -160,12 +161,13 @@ reset(Actor, {_Clock, _Reset, Elems, _Entries, _Deferred} = ORSet) ->
 %% goes from linear to constant.
 %% One way to get constant complexity from this is to store
 %% a clock in our set that works as a limit to add or remove objects.
-%% All the operations that have a dot below the clock are ignored.
-%% Works also for concurrent adds.
+%% All the operations that insert or remove an element in a clock that do
+%% not descend the reset clock are ignored and not performed.
+%% This solution works with local operations and also with concurrent operations.
 -spec reset_all(riak_dt_vclock:vclock(), orswot()) -> {ok, orswot()}.
-reset_all(RClock, {Clock, _Reset, _Elems, _Entries, _Deferred}) ->
+reset_all(RClock, {Clock, Reset, _Elems, _Entries, _Deferred}) ->
 	NewSet = {Clock,
-			  RClock,
+			  riak_dt_vclock:merge([Reset, RClock]),
 			  ordsets:new(),
 			  ?DICT:new(),
 			  ?DICT:new()},
@@ -225,10 +227,10 @@ update({remove, Elem}, Actor, ORSet, _Ctx) ->
     ORSet2 = remove_elem(Actor, ORSet, Elem),
     {ok, ORSet2};
 update({add, Elem}, _Actor, {Clock, Reset, Elems, Entries, Deferred}, Ctx) ->
-    %% Being asked to remove something from set R with a context.  If we
+    %% Being asked to remove something from set R with a context. If we
     %% have this element, we can drop any dots it has that the
     %% Context has seen.
-    Deferred2 = defer_add(Clock, Ctx, Elem, Deferred),
+    Deferred2 = defer_add(Clock, Reset, Ctx, Elem, Deferred),
     case ?DICT:find(Elem, Entries) of
         {ok, ElemClock} ->
             ElemClock2 = riak_dt_vclock:subtract_dots(ElemClock, Ctx),
@@ -279,18 +281,22 @@ update({remove_all, Elems}, Actor, ORSet, _Ctx) ->
 %% maybe.)
 
 %% Modified
--spec defer_add(riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), orswot_op(), deferred()) ->
-                      deferred().
-defer_add(Clock, Ctx, Elem, Deferred) ->
-    case riak_dt_vclock:descends(Clock, Ctx) of
-        %% no need to save this add, we're done
-        true -> Deferred;
-        false -> ?DICT:update(Ctx,
-                                fun(Elems) ->
-                                        ordsets:add_element(Elem, Elems) end,
-                                ordsets:add_element(Elem, ordsets:new()),
-                                Deferred)
-    end.
+-spec defer_add(riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), riak_dt_vclock:vclock(),
+				 orswot_op(), deferred()) -> deferred().
+defer_add(Clock, Reset, Ctx, Elem, Deferred) ->
+	case riak_dt_vclock:descends(Reset, Clock) of
+		true -> Limit = Reset;
+		false -> Limit = Clock
+	end,
+	case riak_dt_vclock:descends(Limit, Ctx) of
+		true -> Deferred;
+		false -> ?DICT:update(Ctx,
+							  fun(Elems) ->
+									  ordsets:add_element(Elem, Elems)
+							  end,
+							  ordsets:add_element(Elem, ordsets:new()),
+							  Deferred)
+	end.
 
 -spec apply_ops([orswot_op], actor() | dot(), orswot()) ->
                        {ok, orswot()} | precondition_error().
@@ -446,31 +452,30 @@ dots_equal([{Elem, Clock1} | Rest], Entries2) ->
     end.
 
 %% Private
-%% TODO: need to change this function
 remove_elem(Dot, {Clock, Reset, Elems, Entries, Deferred}, Elem) when is_tuple(Dot) ->
-	case riak_dt_vclock:descends(Dot, Reset) of
+	case riak_dt_vclock:descends(Clock, Reset) of
 		true ->
 			{riak_dt_vclock:merge([Clock, [Dot]]), Reset, ordsets:del_element(Elem, Elems), ?DICT:store(Elem, [Dot], Entries), Deferred};
 		false ->
 			{riak_dt_vclock:merge([Clock, [Dot]]), Reset, Elems, Entries, Deferred}
 	end;
-remove_elem(Actor, {Clock, Reset, Elems, Entries, Deferred} = Set, Elem) ->
+remove_elem(Actor, {Clock, Reset, Elems, Entries, Deferred}, Elem) ->
     NewClock = riak_dt_vclock:increment(Actor, Clock),
     Dot = [{Actor, riak_dt_vclock:get_counter(Actor, NewClock)}],
 	case riak_dt_vclock:descends(NewClock, Reset) of
 		true ->
 			{NewClock, Reset, ordsets:del_element(Elem, Elems), ?DICT:store(Elem, Dot, Entries), Deferred};
 		false ->
-			Set
+			{NewClock, Reset, Elems, Entries, Deferred}
 	end.
 
 -spec add_elem({ok, riak_dt_vclock:vclock()} | error,
                   member(), {riak_dt_vclock:vclock(), entries(), deferred()}) ->
                          {ok, {riak_dt_vclock:vclock(), entries(), deferred()}} |
                          precondition_error().
-%% TODO: need to change this function
-add_elem({ok, VClock}, Elem, {Clock, Reset, Elems, Dict, Deferred} = Set) ->
-	case riak_dt_vclock:descends(VClock, Reset) of
+
+add_elem({ok, _VClock}, Elem, {Clock, Reset, Elems, Dict, Deferred} = Set) ->
+	case riak_dt_vclock:descends(Clock, Reset) of
 		true ->
 			{ok, {Clock, Reset, ordsets:add_element(Elem, Elems), ?DICT:erase(Elem, Dict), Deferred}};
 		false ->
