@@ -159,7 +159,7 @@ reset(ORSet) ->
 -spec reset_all(riak_dt_vclock:vclock(), orswot) -> {ok, orswot()}.
 reset_all(RClock, {Clock, Reset, _Entries, _Deferred}) ->
 	NewSet = {Clock,
-			  riak_dt_vclock:merge(Reset, RClock),
+			  riak_dt_vclock:merge([Reset, RClock]),
 			  ?DICT:new(),
 			  ?DICT:new()},
 	{ok, NewSet}.
@@ -237,7 +237,7 @@ update({remove, Elem}, _Actor, {Clock, Reset, Entries, Deferred}, Ctx) ->
             %% In a way it makes no sense to have a precon error here,
             %% as the precon has been satisfied or will be: this is
             %% either deferred or a NO-OP
-            {ok, {Clock, Entries, Deferred2}}
+            {ok, {Clock, Reset, Entries, Deferred2}}
     end;
 update({update, Ops}, Actor, ORSet, Ctx) ->
     ORSet2 = lists:foldl(fun(Op, Set) ->
@@ -333,7 +333,10 @@ merge({LHSClock, LHSReset, LHSEntries, LHSDeferred}, {RHSClock, RHSReset, RHSEnt
                                          %% Removed
                                          {Acc, RHSRemaining};
                                      NewDots ->
-										 {?DICT:store(Elem, NewDots, Acc), RHSRemaining}
+										 case riak_dt_vclock:descends(NewDots, RHSReset) of
+											 true -> {?DICT:store(Elem, NewDots, Acc), RHSRemaining};
+											 false -> {Acc, RHSRemaining}
+										 end
                                  end;
                              {ok, RHSDots} ->
                                  %% On both sides
@@ -349,7 +352,10 @@ merge({LHSClock, LHSReset, LHSEntries, LHSDeferred}, {RHSClock, RHSReset, RHSEnt
                                          %% Removed from both sides
                                          {Acc, ?DICT:erase(Elem, RHSRemaining)};
                                      _ ->
-										 {?DICT:store(Elem, V, Acc), ?DICT:erase(Elem, RHSRemaining)}
+										 case riak_dt_vclock:descends(V, Reset) of
+											 true -> {?DICT:store(Elem, V, Acc), ?DICT:erase(Elem, RHSRemaining)};
+											 false -> {Acc, ?DICT:erase(Elem, RHSRemaining)}
+										 end
                                  end
                          end
                  end,
@@ -362,7 +368,10 @@ merge({LHSClock, LHSReset, LHSEntries, LHSDeferred}, {RHSClock, RHSReset, RHSEnt
 										 %% Removed
 										 Acc;
 									 NewDots ->
-										 ?DICT:store(Elem, NewDots, Acc)
+										 case riak_dt_vclock:descends(NewDots, LHSReset) of
+											 true -> ?DICT:store(Elem, NewDots, Acc);
+											 false -> Acc
+										 end
 								 end
 						 end,
 						 Keep,
@@ -424,14 +433,14 @@ add_elem(Dot, {Clock, Reset, Entries, Deferred}, Elem) when is_tuple(Dot) ->
 		false ->
 			{riak_dt_vclock:merge([Clock, [Dot]]), Reset, Entries, Deferred}
 	end;
-add_elem(Actor, {Clock, Reset, Entries, Deferred} = Set, Elem) ->
+add_elem(Actor, {Clock, Reset, Entries, Deferred}, Elem) ->
     NewClock = riak_dt_vclock:increment(Actor, Clock),
     Dot = [{Actor, riak_dt_vclock:get_counter(Actor, NewClock)}],
 	case riak_dt_vclock:descends(NewClock, Reset) of
 		true ->
 			{NewClock, Reset, ?DICT:store(Elem, Dot, Entries), Deferred};
 		false ->
-			Set
+			{NewClock, Reset, Entries, Deferred}
 	end.
 
 -spec remove_elem({ok, riak_dt_vclock:vclock()} | error,
