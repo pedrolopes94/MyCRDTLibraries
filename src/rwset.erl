@@ -147,7 +147,8 @@ new() ->
     {riak_dt_vclock:fresh(), ordsets:new(), ?DICT:new(), ?DICT:new()}.
 
 %% A simple way to delete all elements from the set.
-%% This algorithm has linear complexity.
+%% Each element of the Set is removed by a defined Actor 
+%% and are inserted in our R set (set of removed elements).
 -spec reset(actor(), orswot()) -> {ok, orswot()}.
 reset(Actor, {_Clock, Elems, _Entries, _Deferred} = ORSet) ->
 	NewSet = lists:foldl(fun(Elem, AccSet) ->

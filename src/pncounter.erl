@@ -1,5 +1,5 @@
 %% @author Pedro Lopes
--module(pn_counter).
+-module(pncounter).
 -export([new/0, update/3, value/1, compare/2, merge/2]).
 -include_lib("eunit/include/eunit.hrl").
 
