@@ -90,6 +90,7 @@
 -export([parent_clock/2]).
 -export([to_version/2]).
 -export([reset/2]).
+-export([generate_downstream/3]).
 
 %% EQC API
 -ifdef(EQC).
@@ -448,7 +449,7 @@ stat(Stat, {_C, _El, E, _D}=S) when is_list(E) ->
 stat(actor_count, {Clock, _Elems, _Dict, _}) ->
     length(Clock);
 stat(element_count, {_Clock, Elems, _Dict, _}) ->
-    ?DICT:size(Elems);
+    sets:size(sets:from_list(Elems));
 stat(max_dot_length, {_Clock, _Elems, Dict, _}) ->
     ?DICT:fold(fun(_K, Dots, Acc) ->
                        max(length(Dots), Acc)
@@ -457,7 +458,18 @@ stat(deferred_length, {_Clock, _Elems, _Dict, Deferred}) ->
     ?DICT:size(Deferred);
 stat(_,_) -> undefined.
 
--include("riak_dt_tags.hrl").
+%% @doc generate downstream operations.
+-spec generate_downstream(orswot_op(), actor(), orswot()) -> {ok, orswot_op()}.
+generate_downstream({add, Elem}, _Actor, _ORSet) ->
+    {ok, {add, Elem}};
+generate_downstream({add_all, Elems}, _Actor, _ORSet) ->
+    {ok, {add_all, Elems}};
+generate_downstream({remove, Elem}, _Actor, _ORSet) ->
+    {ok, {remove, Elem}};
+generate_downstream({remove_all,Elems}, _Actor, _ORSet) ->
+    {ok, {remove_all, Elems}}.
+
+-include_lib("riak_dt/include/riak_dt_tags.hrl").
 -define(TAG, ?DT_ORSWOT_TAG).
 -define(V1_VERS, 1).
 -define(V2_VERS, 2).
@@ -601,13 +613,13 @@ no_dots_left_test() ->
     {ok, A} = update({add, 'Z'}, a, new()),
     {ok, B} = update({add, 'Z'}, b, new()),
     C = A, %% replicate A to empty C
-    {ok, A2} = riak_dt_orswot:update({remove, 'Z'}, a, A),
+    {ok, A2} = update({remove, 'Z'}, a, A),
     %% replicate B to A, now A has B's 'Z'
-    A3 = riak_dt_orswot:merge(A2, B),
+    A3 = merge(A2, B),
     %% Remove B's 'Z'
-    {ok, B2} = riak_dt_orswot:update({remove, 'Z'}, b, B),
+    {ok, B2} = update({remove, 'Z'}, b, B),
     %% Replicate C to B, now B has A's old 'Z'
-    B3 = riak_dt_orswot:merge(B2, C),
+    B3 = merge(B2, C),
     %% Merge everytyhing, without the fix You end up with 'Z' present,
     %% with no dots
     Merged = lists:foldl(fun(Set, Acc) ->
@@ -640,7 +652,7 @@ batch_order_test() ->
     {ok, Set} = update({add_all, [<<"bar">>, <<"baz">>]}, a, new()),
     Context  = precondition_context(Set),
     {ok, Set2} = update({update, [{remove, <<"baz">>}, {add, <<"baz">>}]}, a, Set, Context),
-    ?assertEqual([<<"bar">>, <<"baz">>], value(Set2)),
+    ?assertEqual([<<"bar">>], value(Set2)),
     {ok, Set3} = update({update, [{remove, <<"baz">>}, {add, <<"baz">>}]}, a, Set),
     ?assertEqual([<<"bar">>, <<"baz">>], value(Set3)),
     {ok, Set4} = update({remove, <<"baz">>}, a, Set),
