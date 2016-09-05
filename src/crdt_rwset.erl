@@ -64,7 +64,7 @@
 %% Victor Fonte, Ricardo Gonçalves [http://arxiv.org/abs/1011.5808]
 %%
 %% @end
--module(rwset).
+-module(crdt_rwset).
 
 -behaviour(riak_dt).
 

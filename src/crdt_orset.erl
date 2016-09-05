@@ -1,6 +1,6 @@
 %% @author Pedro Lopes
-%% @doc @todo Add description to or_set.
--module(orset).
+%% @doc
+-module(crdt_orset).
 -export([new/0, update/3, value/2, lookup/2, merge/2]).
 -include_lib("eunit/include/eunit.hrl").
 

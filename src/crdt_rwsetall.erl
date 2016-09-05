@@ -1,7 +1,7 @@
 %% -*- coding: utf-8 -*-
 %% -------------------------------------------------------------------
 %%
-%% riak_dt_orswot: Tombstone-less, replicated, state based observe remove set
+%% riak_dt_rwset: Tombstone-less, replicated, remove-wins mixed op- and state- based observe remove
 %%
 %% Copyright (c) 2007-2013 Basho Technologies, Inc.  All Rights Reserved.
 %%
@@ -22,14 +22,18 @@
 %% -------------------------------------------------------------------
 
 %% @doc An OR-Set CRDT. An OR-Set allows the adding, and removal, of
-%% elements. Should an add and remove be concurrent, the add wins. In
-%% this implementation there is a version vector for the whole set.
-%% When an element is added to the set, the version vector is
-%% incremented and the `{actor(), count()}' pair for that increment is
-%% stored against the element as its "birth dot". Every time the
-%% element is re-added to the set, its "birth dot" is updated to that
-%% of the `{actor(), count()}' version vector entry resulting from the
-%% add. When an element is removed, we simply drop it, no tombstones.
+%% elements. Should an add and remove be concurrent, the remove wins. 
+%% There are two sets that we consider: one that holds the current
+%% list of elements of the set - E - and another set that keeps track of
+%% remove operations applied on the previous set - R.
+%% In this implementation there is a version vector for the whole set.
+%% When an element is removed from set E, the version vector is
+%% incremented and the '{actor(), count()}' pair for that increment is
+%% stored against the element as its "birth dot". On consecutive removes
+%% of the same element, its "birth dot" is updated to that
+%% of the '{actor(), count()}' version vector entry resulting from the
+%% remove. When an element is added to set E, we simply drop it from
+%% set R, with no tombstones needed.
 %%
 %% When an element exists in replica A and not replica B, is it
 %% because A added it and B has not yet seen that, or that B removed
@@ -60,7 +64,7 @@
 %% Victor Fonte, Ricardo Gonçalves [http://arxiv.org/abs/1011.5808]
 %%
 %% @end
--module(orswot).
+-module(crdt_rwsetall).
 
 -behaviour(riak_dt).
 
@@ -85,7 +89,7 @@
 -export([is_operation/1]).
 -export([parent_clock/2]).
 -export([to_version/2]).
--export([reset/1, reset_all/2]).
+-export([reset_all/2]).
 %% New API (op-based operations)
 -export([update/2, generate_downstream/3]).
 
@@ -99,15 +103,16 @@
 -export_type([orswot/0, orswot_op/0, binary_orswot/0]).
 
 -type orswot() :: v1_orswot() | v2_orswot().
--type v2_orswot() :: {riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), entries(), deferred()}.
--type v1_orswot() :: {riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), {member(), dots()},
+-type v2_orswot() :: {riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), ordsets:ordsets(), entries(), deferred()}.
+-type v1_orswot() :: {riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), ordsets:ordsets(), {member(), dots()},
                       {riak_dt_vclock:vclock(), [member()]}}.
 
 -type any_orswot() :: v2_orswot() | v2ord_orswot().
 
--type v2ord_orswot() :: {riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), orddict:orddict(), orddict:orddict()}.
+-type v2ord_orswot() :: {riak_dt_vclock:vclock(), riak_dt_vclock:vclock(),
+						 ordsets:ordsets(), orddict:orddict(), orddict:orddict()}.
 
-%% Only removes can be deferred, so a list of members to be removed
+%% Only removes can be deferred, so a list of members to be added
 %% per context.
 -type deferred() :: dict(riak_dt_vclock:vclock(), [member()]).
 -type binary_orswot() :: binary(). %% A binary that from_binary/1 will operate on.
@@ -115,16 +120,16 @@
 -type orswot_op() ::  {add, member()} | {remove, member()} |
                       {add_all, [member()]} | {remove_all, [member()]} |
                       {update, [orswot_op()]} |
-                      {remove, {member(), actor() | {dot(), [dot()]}}} |
-                      {add, {member(), actor() | dot()}} |
-                      {remove_all, {[member()], [{dot(), [member()]}]}} | {add_all, {[member()], actor() | [dot()]}} |
+                      {add, {member(), actor() | {dot(), [dot()]}}} |
+                      {remove, {member(), actor() | dot()}} |
+                      {add_all, {[member()], [{dot(), [member()]}]}} | {remove_all, {[member()], actor() | [dot()]}} |
                       {reset, {riak_dt_vclock:vclock(), actor()}}.
--type orswot_q()  :: size | {contains, term()}.
+-type orswot_q()  :: size | {contains, term()} | {tokens, term()}.
 
 -type actor() :: riak_dt:actor().
 
 %% a dict of member() -> minimal_clock() mappings.  The
-%% `minimal_clock()' is a more effecient way of storing knowledge
+%% 'minimal_clock()' is a more effecient way of storing knowledge
 %% about adds / removes than a UUID per add.
 -type entries() :: dict(member(), dots()).
 
@@ -146,56 +151,75 @@
 
 -spec new() -> orswot().
 new() ->
-    {riak_dt_vclock:fresh(), riak_dt_vclock:fresh(), ?DICT:new(), ?DICT:new()}.
+    {riak_dt_vclock:fresh(), riak_dt_vclock:fresh(), ordsets:new(), ?DICT:new(), ?DICT:new()}.
 
-%% Cleans all the elements from the set.
--spec reset(orswot()) -> {ok, orswot()}.
-reset(ORSet) ->
-	Elems = value(ORSet),
-	update({remove_all, Elems}, undefined, ORSet).
-	%%remove_all(Elems, undefined, ORSet).
-
-%% A new reset operation that gets a reset clock that works
-%% as a limit to add or remove objects elements from the Set.
-%% Every add operation with a Dot that do not descend our reset clock,
-%% is not performed. However, the Clock must be incremented, even though the
-%% element is not inserted in the Set. If the Clock was not incremented,
-%% we would never be able to add new elements, because the reset clock was
-%% never going to be descended.
--spec reset_all(riak_dt_vclock:vclock(), orswot) -> {ok, orswot()} | {error, {invalid_reset, riak_dt_vclock:vclock()}}.
-reset_all(RClock, {Clock, Reset, Entries, Deferred}) ->
+%% A solution for reset, where its complexity is constant.
+%% One way to get constant complexity is to store
+%% a clock in our set that works as a limit to add or remove objects.
+%% All the operations that insert or remove an element in a clock that do
+%% not descend the reset clock are ignored and not performed.
+%% Clock will be equals to RClock so we can make local operations.
+%% This solution works with local operations and also with concurrent operations.
+-spec reset_all(riak_dt_vclock:vclock(), orswot()) -> {ok, orswot()} | {error, {invalid_reset, riak_dt_vclock:vclock()}}.
+reset_all({RClock, ToRemove}, {Clock, _Reset, Elems, Entries, Deferred}) ->
+	%% Searching dots in RClock that are not greater than their corresponding in Clock
+	GreaterClks = lists:filter(fun({Actor, Clk}) ->
+									   Clk =< riak_dt_vclock:get_counter(Actor, Clock)
+							   end,
+							   RClock),
+	%% If any dot exists under the above conditions, the elements are subtracted
+	%% with the set of elements to remove. Otherwise, the set of elements is an empty set.
+	NewElems = case length(GreaterClks) of
+				   0 -> ordsets:new();
+				   _ -> ordsets:subtract(Elems, ToRemove)
+			   end,
+	%% Searching for timestamps greater than the RClock dots.
+	NewEntries = ?DICT:fold(fun(Elem, TimeStamps, Acc) ->
+								NewTs = lists:filter(fun({Actor, Ts}) ->
+														Ts > riak_dt_vclock:get_counter(Actor, RClock)
+													 end,
+													 TimeStamps),
+								case NewTs of
+									[] -> Acc;
+									_ -> ?DICT:store(Elem, NewTs, Acc)
+								end
+							end,
+							?DICT:new(),
+							Entries),
+	NewResetClock = riak_dt_vclock:merge([Clock, RClock]),
+	{ok, {NewResetClock, NewResetClock, NewElems, NewEntries, Deferred}};
+	
+reset_all(RClock, {Clock, Reset, Elems, Entries, Deferred}) ->
 	case riak_dt_vclock:descends(RClock, Clock) of
 		true ->
 			NewReset = riak_dt_vclock:merge([Reset, RClock]),
 			{ok, {NewReset,
-				  NewReset,
-				  ?DICT:new(),
-				  ?DICT:new()}};
+			 NewReset,
+			 ordsets:new(),
+			 ?DICT:new(),
+			 ?DICT:new()}};
 		false ->
-			%%{error, {invalid_reset, RClock}}
-			{Clock, Reset, Entries, Deferred}
+		 	%%{error, {invalid_reset, RClock}}
+			{ok, {Clock, Reset, Elems, Entries, Deferred}}
 	end.
-			
 
-%% @doc sets the clock in the Set to that `Clock'. Used by a
+%% @doc sets the clock in the Set to that 'Clock'. Used by a
 %% containing Map for sub-CRDTs
 -spec parent_clock(riak_dt_vclock:vclock(), orswot()) -> orswot().
 parent_clock(Clock, Set) ->
-    {_SetClock, Reset, Entries, Deferred} = to_v2(Set),
-    {Clock, Reset, Entries, Deferred}.
+    {_SetClock, Reset, Elems, Entries, Deferred} = to_v2(Set),
+    {Clock, Reset, Elems, Entries, Deferred}.
 
 -spec value(orswot()) -> [member()].
-value({_Clock, _Reset, Entries, _Deferred}) when is_list(Entries) ->
-    [K || {K, _Dots} <- Entries];
-value({_Clock, _Reset, Entries, _Deferred}) ->
-    lists:sort([K || {K, _Dots} <- ?DICT:to_list(Entries)]).
+value({_Clock, _Reset, Elems, _Entries, _Deferred}) ->
+    Elems.
 
 -spec value(orswot_q(), orswot()) -> term().
 value(size, ORset) ->
     length(value(ORset));
 value({contains, Elem}, ORset) ->
-    lists:member(Elem, value(ORset));
-value({tokens, Elem}, {_C, _R, Entries, _D}) ->
+    ordsets:is_element(Elem, value(ORset));
+value({tokens, Elem}, {_C, _R, _E, Entries, _D}) ->
     case ?DICT:find(Elem, Entries) of
         error ->
             orddict:new();
@@ -205,6 +229,7 @@ value({tokens, Elem}, {_C, _R, Entries, _D}) ->
 
 %% @doc take a list of Set operations and apply them to the set.
 %% NOTE: either _all_ are applied, or _none_ are.
+%% Modified
 -spec update(orswot_op(), orswot()) -> {ok, orswot()} | precondition_error().
 update({add, {Elem, Actor}}, ORSet) ->
     update({add, Elem}, Actor, ORSet);
@@ -214,59 +239,83 @@ update({add_all, {Elems, Actor}}, ORSet) ->
    update({add_all, Elems}, Actor, ORSet);
 update({remove_all, {Elems, Actor}}, ORSet) ->
     update({remove_all, Elems}, Actor, ORSet);
-update({reset, {ResetClk, _Actor}}, ORSet) ->
-	reset_all(ResetClk, ORSet).
+update({reset, {ResetClk, ToRemove}}, ORSet) ->
+	reset_all({ResetClk, ToRemove}, ORSet).
+	%case ResetClk of
+	%	[current] -> reset_all(Clock, ORSet);
+	%	_ -> reset_all(ResetClk, ORSet)
+	%end.
 
 -spec update(orswot_op(), actor() | dot() | [dot()] | {dot(), [member()]}, orswot()) -> {ok, orswot()} |
                                                 precondition_error().
-update(Op, Actor, {_Clock, _Reset, Entries, _Deferred}=V1Set) when is_list(Entries) ->
+update(Op, Actor, {_Clock, _Reset, _Elems, Entries, _Deferred}=V1Set) when is_list(Entries) ->
     update(Op, Actor, to_v2(V1Set));
 update({update, Ops}, Actor, ORSet) ->
     apply_ops(Ops, Actor, ORSet);
-update({add, Elem}, Actor, ORSet) ->
-    {ok, add_elem(Actor, ORSet, Elem)};
 update({remove, Elem}, Actor, ORSet) ->
-    remove_elem(Actor, Elem, ORSet);
-update({add_all, Elems}, Actor, ORSet) ->
-	AddOps = lists:foldl(fun(Elem, Sum) ->
-									Sum ++ [{add, Elem}]
-							end,
-							[],
-							Elems),
-	apply_ops(AddOps, Actor, ORSet);
-
-%% @doc note: this is atomic, either _all_ `Elems` are removed, or
-%% none are.
+    {ok, remove_elem(Actor, ORSet, Elem)};
+update({add, Elem}, Actor, ORSet) ->
+    add_elem(Actor, Elem, ORSet);
+%% New function
+update({remove_all, [{RClock, reset} | Elems]}, [_Unused | Actor], {Clock, _R, _El, _En, _D}=ORSet) ->
+	%ResetClock = case RClock of
+	%			 	[current] -> Clock;
+	%				_ -> RClock
+	%			 end,
+	case riak_dt_vclock:descends(RClock, Clock) of
+		false -> update({remove_all, Elems}, Actor, ORSet);
+		true -> ORSet
+	end;
 update({remove_all, Elems}, Actor, ORSet) ->
 	RemoveOps = lists:foldl(fun(Elem, Sum) ->
 									Sum ++ [{remove, Elem}]
 							end,
 							[],
 							Elems),
-	apply_ops(RemoveOps, Actor, ORSet).
+	apply_ops(RemoveOps, Actor, ORSet);
+
+%% @doc note: this is atomic, either _all_ 'Elems' are added, or
+%% none are.
+%% New function
+update({add_all, [{RClock, reset} | Elems]}, [_Unused | Actor], {Clock, _R, _El, _En, _D}=ORSet) ->
+	%ResetClock = case RClock of
+	%			 	[current] -> Clock;
+	%				_ -> RClock
+	%			 end,
+	case riak_dt_vclock:descends(RClock, Clock) of
+		false -> update({add_all, Elems}, Actor, ORSet);
+		true -> ORSet
+	end;
+update({add_all, Elems}, Actor, ORSet) ->
+	AddOps = lists:foldl(fun(Elem, Sum) ->
+									Sum ++ [{add, Elem}]
+							end,
+							[],
+							Elems),
+	apply_ops(AddOps, Actor, ORSet).
 
 -spec update(orswot_op(), actor() | dot(), orswot(), riak_dt:context()) ->
                     {ok, orswot()} | precondition_error().
-update(Op, Actor, {_Clock, _Reset, Entries, _Deferred}=V1Set, Ctx) when is_list(Entries) ->
+update(Op, Actor, {_Clock, _Reset, _Elems, Entries, _Deferred}=V1Set, Ctx) when is_list(Entries) ->
     update(Op, Actor, to_v2(V1Set), Ctx);
 update(Op, Actor, ORSet, undefined) ->
     update(Op, Actor, ORSet);
-update({add, Elem}, Actor, ORSet, _Ctx) ->
-    ORSet2 = add_elem(Actor, ORSet, Elem),
+update({remove, Elem}, Actor, ORSet, _Ctx) ->
+    ORSet2 = remove_elem(Actor, ORSet, Elem),
     {ok, ORSet2};
-update({remove, Elem}, _Actor, {Clock, Reset, Entries, Deferred}, Ctx) ->
-    %% Being asked to remove something with a context.  If we
+update({add, Elem}, _Actor, {Clock, Reset, Elems, Entries, Deferred}, Ctx) ->
+    %% Being asked to add something to the element set, with a context. If we
     %% have this element, we can drop any dots it has that the
     %% Context has seen.
-    Deferred2 = defer_remove(Clock, Reset, Ctx, Elem, Deferred),
+    Deferred2 = defer_add(Clock, Reset, Ctx, Elem, Deferred),
     case ?DICT:find(Elem, Entries) of
         {ok, ElemClock} ->
             ElemClock2 = riak_dt_vclock:subtract_dots(ElemClock, Ctx),
             case ElemClock2 of
                 [] ->
-                    {ok, {Clock, Reset, ?DICT:erase(Elem, Entries), Deferred2}};
+                    {ok, {Clock, Reset, ordsets:add_element(Elem, Elems), ?DICT:erase(Elem, Entries), Deferred2}};
                 _ ->
-                    {ok, {Clock, Reset, ?DICT:store(Elem, ElemClock2, Entries), Deferred2}}
+                    {ok, {Clock, Reset, ordsets:del_element(Elem, Elems), ?DICT:store(Elem, ElemClock2, Entries), Deferred2}}
             end;
         error ->
             %% Do we not have the element because we removed it
@@ -275,7 +324,7 @@ update({remove, Elem}, _Actor, {Clock, Reset, Entries, Deferred}, Ctx) ->
             %% In a way it makes no sense to have a precon error here,
             %% as the precon has been satisfied or will be: this is
             %% either deferred or a NO-OP
-            {ok, {Clock, Reset, Entries, Deferred2}}
+            {ok, {Clock, Reset, Elems, Entries, Deferred2}}
     end;
 update({update, Ops}, Actor, ORSet, Ctx) ->
     ORSet2 = lists:foldl(fun(Op, Set) ->
@@ -285,40 +334,41 @@ update({update, Ops}, Actor, ORSet, Ctx) ->
                          ORSet,
                          Ops),
     {ok, ORSet2};
-update({remove_all, Elems}, Actor, ORSet, Ctx) ->
-    remove_all(Elems, Actor, ORSet, Ctx);
-update({add_all, Elems}, Actor, ORSet, _Ctx) ->
-    update({add_all, Elems}, Actor, ORSet).
+update({add_all, Elems}, Actor, ORSet, Ctx) ->
+    add_all(Elems, Actor, ORSet, Ctx);
+update({remove_all, Elems}, Actor, ORSet, _Ctx) ->
+    update({remove_all, Elems}, Actor, ORSet).
 
 
-%% @private If we're asked to remove something we don't have (or have,
-%% but maybe not having seen all 'adds' for the element), is it
-%% because we've not seen the add that we've been asked to remove, or
-%% is it because we already removed it? In the former case, we can
-%% "defer" this operation by storing it, with its context, for later
-%% execution. If the clock for the Set descends the operation clock,
+%% @private If we're asked to remove something from R
+%% (add an element to E) we don't have, is it
+%% because we've not seen the add that we've been asked for, or
+%% is it because we already removed it (added to set E)?
+%% In the former case, we can "defer" the add operation
+%% of an element by storing it, with its context, for later execution.
+%% If the clock for the Set descends the operation clock,
 %% then we don't need to defer the op, its already been done. It is
 %% _very_ important to note, that only _actorless_ operations can be
 %% saved. That is operations that DO NOT increment the clock. In
-%% ORSWOTS this is easy, as only removes need a context. A context for
-%% an 'add' is meaningless.
+%% ORSWOTS with remove-wins this is easy, as only adds need a context.
+%% A context for a 'remove' is meaningless.
 %%
 %% @TODO revist this, as it might be meaningful in some cases (for
 %% true idempotence) and we can have merges triggering updates,
 %% maybe.)
--spec defer_remove(riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), riak_dt_vclock:vclock(),
-				   orswot_op(), deferred()) -> deferred().
-defer_remove(Clock, _Reset, Ctx, Elem, Deferred) ->
-    case riak_dt_vclock:descends(Clock, Ctx) of
-        %% no need to save this remove, we're done
-        true -> Deferred;
-        false -> ?DICT:update(Ctx,
+
+-spec defer_add(riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), riak_dt_vclock:vclock(),
+				 orswot_op(), deferred()) -> deferred().
+defer_add(Clock, _Reset, Ctx, Elem, Deferred) ->
+	case riak_dt_vclock:descends(Clock, Ctx) of
+		true -> Deferred;
+		false -> ?DICT:update(Ctx,
 							  fun(Elems) ->
 									  ordsets:add_element(Elem, Elems)
 							  end,
 							  ordsets:add_element(Elem, ordsets:new()),
 							  Deferred)
-    end.
+	end.
 
 -spec apply_ops([orswot_op], actor() | dot(), orswot()) ->
                        {ok, orswot()} | precondition_error().
@@ -339,29 +389,27 @@ apply_ops([Op | Rest], [Dot | Dots], ORSet) ->
 			Error
 	end.
 
-remove_all([], _Actor, ORSet, _Ctx) ->
+add_all([], _Actor, ORSet, _Ctx) ->
     {ok, ORSet};
-remove_all([Elem | Rest], Actor, ORSet, Ctx) ->
-    {ok, ORSet2} =  update({remove, Elem}, Actor, ORSet, Ctx),
-    remove_all(Rest, Actor, ORSet2, Ctx).
+add_all([Elem | Rest], Actor, ORSet, Ctx) ->
+    {ok, ORSet2} = update({add, Elem}, Actor, ORSet, Ctx),
+    add_all(Rest, Actor, ORSet2, Ctx).
 
 -spec merge(orswot(), orswot()) -> orswot().
 merge({_LHSC, _LHSR, LHSE, _LHSD}=LHS, {_RHSC, _RHSR, RHSE, _RHSD}=RHS) when is_list(LHSE);
-                                                               is_list(RHSE) ->
+															   is_list(RHSE) ->
     merge(to_v2(LHS), to_v2(RHS));
-merge({Clock, Reset, Entries, Deferred}, {Clock, Reset, Entries, Deferred}) ->
-    {Clock, Reset, Entries, Deferred};
-merge({LHSClock, LHSReset, LHSEntries, LHSDeferred}, {RHSClock, RHSReset, RHSEntries, RHSDeferred}) ->
+merge({Clock, Reset, Elems, Entries, Deferred}, {Clock, Reset, Elems, Entries, Deferred}) ->
+    {Clock, Reset, Elems, Entries, Deferred};
+merge({LHSClock, LHSReset, LHSElems, LHSEntries, LHSDeferred}, {RHSClock, RHSReset, RHSElems, RHSEntries, RHSDeferred}) ->
     Clock = riak_dt_vclock:merge([LHSClock, RHSClock]),
 	Reset = riak_dt_vclock:merge([LHSReset, RHSReset]), %% Merge the two Reset clocks
-    {Keep, RHSElems} = ?DICT:fold(fun(Elem, Dots, {Acc, RHSRemaining}) ->
+    {Keep, RHSElems2} = ?DICT:fold(fun(Elem, Dots, {Acc, RHSRemaining}) ->
                          case ?DICT:find(Elem, RHSEntries) of
                              error ->
-                                 %% Only on left, trim dots and keep
-                                 %% surviving
+                                 %% Only on left, trim dots
                                  case riak_dt_vclock:subtract_dots(Dots, RHSClock) of
                                      [] ->
-                                         %% Removed
                                          {Acc, RHSRemaining};
                                      NewDots ->
 										 {?DICT:store(Elem, NewDots, Acc), RHSRemaining}
@@ -377,7 +425,6 @@ merge({LHSClock, LHSReset, LHSEntries, LHSDeferred}, {RHSClock, RHSReset, RHSEnt
                                  %% Perfectly possible that an item in both sets should be dropped
                                  case V of
                                      [] ->
-                                         %% Removed from both sides
                                          {Acc, ?DICT:erase(Elem, RHSRemaining)};
                                      _ ->
 										 {?DICT:store(Elem, V, Acc), ?DICT:erase(Elem, RHSRemaining)}
@@ -386,21 +433,44 @@ merge({LHSClock, LHSReset, LHSEntries, LHSDeferred}, {RHSClock, RHSReset, RHSEnt
                  end,
                  {?DICT:new(), RHSEntries},
                  LHSEntries),
-    %%Now what about the stuff left from the right hand side? Do the same to that!
+    %% Doing the same to the right side
     Entries = ?DICT:fold(fun(Elem, Dots, Acc) ->
 								 case riak_dt_vclock:subtract_dots(Dots, LHSClock) of
 									 [] ->
-										 %% Removed
 										 Acc;
 									 NewDots ->
 										 ?DICT:store(Elem, NewDots, Acc)
 								 end
 						 end,
 						 Keep,
-						 RHSElems),
+						 RHSElems2),
+	%% Check element by element to see if becomes part of the
+	%% final set of elements.
+	%% For each element, it is verified if it was removed in the other
+	%% replica and if it does, verifies if its remove has already
+	%% been seen by the current replica (by checking the local version vector).
+	Keys = ordsets:from_list(dict:fetch_keys(Entries)),
+	Elems = ordsets:subtract(ordsets:union(LHSElems, RHSElems), Keys),
+	
     Deffered = merge_deferred(LHSDeferred, RHSDeferred),
+	
+    apply_deferred(Clock, Reset, Elems, Entries, Deffered).
 
-    apply_deferred(Clock, Reset, Entries, Deffered).
+%% Another way of getting the final set of elements (for merge only)
+%%fold_elements(Clock1, Elems1, Entries2) ->
+%%	ordsets:fold(fun(Elem, Acc) ->
+%%						case ?DICT:find(Elem, Entries2) of
+%%							{ok, [{Actor, Clk}]} ->
+%%								case riak_dt_vclock:get_counter(Actor, Clock1) of
+%%									Cnt when Clk > Cnt -> Acc;
+%%									_ -> ordsets:add_element(Elem, Acc)
+%%								end;
+%%							error ->
+%%								ordsets:add_element(Elem, Acc)
+%%						end
+%%				 end,
+%%				 [],
+%%				 Elems1).
 
 %% @private merge the deffered operations for both sets.
 -spec merge_deferred(deferred(), deferred()) -> deferred().
@@ -414,23 +484,25 @@ merge_deferred(LHS, RHS) ->
 %%
 %% @TODO again, think hard on this, should it be called in process by
 %% an actor only?
--spec apply_deferred(riak_dt_vclock:vclock(), riak_dt_vclock:vclock(), entries(), deferred()) ->
+-spec apply_deferred(riak_dt_vclock:vclock(), riak_dt_vclock:vclock(),
+					 ordsets:ordsets(), entries(), deferred()) ->
                             orswot().
-apply_deferred(Clock, Reset, Entries, Deferred) ->
-    ?DICT:fold(fun(Ctx, Elems, ORSwot) ->
-                       {ok, ORSwot2} = remove_all(Elems, undefined,  ORSwot, Ctx),
+apply_deferred(Clock, Reset, Elems, Entries, Deferred) ->
+    ?DICT:fold(fun(Ctx, Elems2, ORSwot) ->
+                       {ok, ORSwot2} = add_all(Elems2, undefined,  ORSwot, Ctx),
                        ORSwot2
                 end,
-               {Clock, Reset, Entries, ?DICT:new()}, %% Start with an empty deferred list
+               {Clock, Reset, Elems, Entries, ?DICT:new()}, %% Start with an empty deferred list
                Deferred).
 
 -spec equal(orswot(), orswot()) -> boolean().
 equal({_, _, Entries1, _}=LHS, {_, _, Entries2, _}=RHS) when is_list(Entries1);
                                                        is_list(Entries2) ->
     equal(to_v2(LHS), to_v2(RHS));
-equal({Clock1, Reset1, Entries1, _}, {Clock2, Reset2, Entries2, _}) ->
+equal({Clock1, Reset1, Elems1, Entries1, _}, {Clock2, Reset2, Elems2, Entries2, _}) ->
     riak_dt_vclock:equal(Clock1, Clock2) andalso
 		riak_dt_vclock:equal(Reset1, Reset2) andalso
+		lists:sort(Elems1) == lists:sort(Elems2) andalso
         lists:sort(?DICT:fetch_keys(Entries1)) == lists:sort(?DICT:fetch_keys(Entries2)) andalso
         dots_equal(?DICT:to_list(Entries1), ?DICT:to_list(Entries2)).
 
@@ -447,75 +519,66 @@ dots_equal([{Elem, Clock1} | Rest], Entries2) ->
     end.
 
 %% Private
--spec add_elem(actor() | dot(), orswot(), member()) -> orswot().
-add_elem({Actor, Clk} = Dot, {Clock, Reset, Entries, Deferred} = ORSet, Elem) when is_tuple(Dot) ->
+remove_elem({Actor, Clk} = Dot, {Clock, Reset, Elems, Entries, Deferred} = ORSet, Elem) when is_tuple(Dot) ->
 	case riak_dt_vclock:get_counter(Actor, Clock) < Clk of
 		true ->
 			NewClock = riak_dt_vclock:merge([Clock, [Dot]]),
 			case value({tokens, Elem}, ORSet) of
 				[] -> 
-					{NewClock, Reset, ?DICT:store(Elem, [Dot], Entries), Deferred};
+					{NewClock, Reset, ordsets:del_element(Elem, Elems), ?DICT:store(Elem, [Dot], Entries), Deferred};
 				Tokens ->
 					NewTimestamps = orddict:merge(fun(_K, V1, V2) ->
 														max(V1, V2)
 												end,
 												orddict:from_list(Tokens),
 												orddict:from_list([Dot])),
-					{NewClock, Reset, ?DICT:store(Elem, orddict:to_list(NewTimestamps), Entries), Deferred}
+					{NewClock, Reset, ordsets:del_element(Elem, Elems),
+					 ?DICT:store(Elem, orddict:to_list(NewTimestamps), Entries), Deferred}
 			end;
 		false ->
-			{Clock, Reset, Entries, Deferred}
+			{Clock, Reset, Elems, Entries, Deferred}
 	end;
-add_elem(Actor, {Clock, Reset, Entries, Deferred}, Elem) ->
-    NewClock = riak_dt_vclock:increment(Actor, Clock),
-    Dot = [{Actor, riak_dt_vclock:get_counter(Actor, NewClock)}],
-	case riak_dt_vclock:descends(NewClock, Clock) of
-		true ->
-			{NewClock, Reset, ?DICT:store(Elem, Dot, Entries), Deferred};
-		false ->
-			{NewClock, Reset, Entries, Deferred}
-	end.
+remove_elem(Actor, {Clock, Reset, Elems, Entries, Deferred}, Elem) ->
+	NewClock = riak_dt_vclock:increment(Actor, Clock),
+	Dot = [{Actor, riak_dt_vclock:get_counter(Actor, NewClock)}],
+	{NewClock, Reset, ordsets:del_element(Elem, Elems), ?DICT:store(Elem, Dot, Entries), Deferred}.
 
--spec remove_elem(actor() | {{actor,riak_dt_vclock:vclock()},[dot()]},
+-spec add_elem(actor() | {{actor,riak_dt_vclock:vclock()},[dot()]},
                   member(), {riak_dt_vclock:vclock(), entries(), deferred()}) ->
                          {ok, {riak_dt_vclock:vclock(), entries(), deferred()}} |
                          precondition_error().
-remove_elem({{Actor,Clk}, Dots}, Elem, {Clock, Reset, Entries, Deferred}) ->
+
+add_elem({{Actor, Clk}, Dots}, Elem, {Clock, Reset, Elems, Entries, Deferred}) when is_list(Dots) ->
 	case riak_dt_vclock:get_counter(Actor, Clock) =< Clk of
 		true ->
 			case ?DICT:find(Elem, Entries) of
 				error ->
-					{ok, {Clock, Reset, Entries, Deferred}};
+					{ok, {Clock, Reset, ordsets:add_element(Elem, Elems), Entries, Deferred}};
 				{ok, Timestamps} ->
 					Remained = Timestamps -- Dots,
 					case Remained of
 						[] ->
-							{ok, {Clock, Reset, ?DICT:erase(Elem, Entries), Deferred}};
+							{ok, {Clock, Reset, ordsets:add_element(Elem, Elems), ?DICT:erase(Elem,Entries), Deferred}};
 						_ ->
-							{ok, {Clock, Reset, ?DICT:store(Elem, Remained, Entries), Deferred}}
+							{ok, {Clock, Reset, Elems, ?DICT:store(Elem, Remained, Entries), Deferred}}
 					end
 			end;
 		false ->
-			{ok, {Clock, Reset, Entries, Deferred}}
+			{ok, {Clock, Reset, Elems, Entries, Deferred}}
 	end;
-remove_elem(_Actor, Elem, {Clock, Reset, Entries, Deferred}) ->
-	case ?DICT:find(Elem, Entries) of
-		[] ->
-			{error, {precondition, {not_present, Elem}}};
-		_ ->
-			{ok, {Clock, Reset, ?DICT:erase(Elem, Entries), Deferred}}
-	end.
+add_elem(_, Elem, {Clock, Reset, Elems, Entries, Deferred}) ->
+	{ok, {Clock, Reset, ordsets:add_element(Elem, Elems), ?DICT:erase(Elem,Entries), Deferred}}.
 
 %% @doc the precondition context is a fragment of the CRDT that
 %%  operations requiring certain pre-conditions can be applied with.
 %%  Especially useful for hybrid op/state systems where the context of
 %%  an operation is needed at a replica without sending the entire
 %%  state to the client. In the case of the ORSWOT the context is a
-%%  version vector. When passed as an argument to `update/4' the
-%%  context ensures that only seen adds are removed, and that removes
-%%  of unseen adds can be deferred until they're seen.
+%%  version vector. When passed as an argument to 'update/4' the
+%%  context ensures that only seen removes are removed from set R, and that adds
+%%  of unseen removes can be deferred until they're seen.
 -spec precondition_context(orswot()) -> orswot().
-precondition_context({Clock, _Reset, _Entries, _Deferred}) ->
+precondition_context({Clock, _Reset, _Elems, _Entries, _Deferred}) ->
     Clock.
 
 -spec stats(orswot()) -> [{atom(), number()}].
@@ -524,46 +587,74 @@ stats(ORSWOT) ->
     [ {S, stat(S, OSV2)} || S <- [actor_count, element_count, max_dot_length, deferred_length]].
 
 -spec stat(atom(), orswot()) -> number() | undefined.
-stat(Stat, {_C, _R, E, _D}=S) when is_list(E) ->
+stat(Stat, {_C, _R, _El, E, _D}=S) when is_list(E) ->	
     stat(Stat, to_v2(S));
-stat(actor_count, {Clock, _R, _Dict, _}) ->
+stat(actor_count, {Clock, _Reset, _Elems, _Dict, _}) ->
     length(Clock);
-stat(element_count, {_Clock, _Reset, Dict, _}) ->
-    ?DICT:size(Dict);
-stat(max_dot_length, {_Clock, _Reset, Dict, _}) ->
+stat(element_count, {_Clock, _Reset, Elems, _Dict, _}) ->
+    sets:size(sets:from_list(Elems));
+stat(max_dot_length, {_Clock, _Reset, _Elems, Dict, _}) ->
     ?DICT:fold(fun(_K, Dots, Acc) ->
                        max(length(Dots), Acc)
                end, 0, Dict);
-stat(deferred_length, {_Clock, _Reset, _Dict, Deferred}) ->
+stat(deferred_length, {_Clock, _Reset, _Elems, _Dict, Deferred}) ->
     ?DICT:size(Deferred);
 stat(_,_) -> undefined.
 
 %% @doc generate downstream operations.
 -spec generate_downstream(orswot_op(), actor(), orswot()) -> {ok, orswot_op()}.
-generate_downstream({add, Elem}, Actor, {Clock, _Reset, _Entries, _Deferred}) ->
-	NewClock = riak_dt_vclock:increment(Actor, Clock),
-    Dot = {Actor, riak_dt_vclock:get_counter(Actor, NewClock)},
-    {ok, {add, {Elem, Dot}}};
-generate_downstream({add_all, Elems}, Actor, {Clock, _Reset, _Entries, _Deferred}) ->
-	[_ | DownstreamOp] = lists:foldl(fun(_Elem, [Clk | Sum]) ->
-                                NewClock = riak_dt_vclock:increment(Actor, Clk),
-    							Dot = {Actor, riak_dt_vclock:get_counter(Actor, NewClock)},
-                                [NewClock] ++ Sum ++ [Dot]
-                                end, [Clock], Elems),
-    {ok, {add_all, {Elems, DownstreamOp}}};
-generate_downstream({remove, Elem}, Actor, {Clock, _Reset, _Entries, _Deferred} = ORSet) ->
+%% In the function below, passing a dot downstream is useful
+%% because it will help us to determine if the element can be
+%% added to some set by comparing clocks.
+%% One case where the add operation is not executed is when
+%% the operation witnesses a set who suffered from a reset
+%% operation, where the clock can be "increased" by that effect,
+%% and thus the add is invalid for that set.
+generate_downstream({add, Elem}, Actor, {Clock, _Reset, _Elems, _Entries, _Deferred} = ORSet) ->
 	ToRemove = value({tokens, Elem}, ORSet),
 	Dot = {Actor, riak_dt_vclock:get_counter(Actor, Clock)},
-    {ok, {remove, {Elem, {Dot, ToRemove}}}};
-generate_downstream({remove_all, Elems}, Actor, {Clock, _Reset, _Entries, _Deferred} = ORSet) ->
+    {ok, {add, {Elem, {Dot, ToRemove}}}};
+generate_downstream({add_all, AddElems}, Actor, {Clock, _Reset, _Elems, _Entries, _Deferred} = ORSet) ->
 	Dot = {Actor, riak_dt_vclock:get_counter(Actor, Clock)},
 	ToRemove = lists:foldl(fun(Elem, Sum) ->
-							Sum ++ [{Dot, value({tokens, Elem}, ORSet)}]
-							end, [], Elems),
-    {ok, {remove_all, {Elems, ToRemove}}};
-generate_downstream({reset, ResetClk}, Actor, _ORSet) ->
-	{ok, {reset, {ResetClk, Actor}}}.
-
+							case Elem of
+								{ResetClk, reset} ->
+									NewResetClk = case ResetClk of
+													  [current] -> riak_dt_vclock:increment(Actor, Clock);
+													  _ -> ResetClk
+												  end,
+									Sum ++ [{NewResetClk, reset}];
+								_ ->
+									Sum ++ [{Dot, value({tokens, Elem}, ORSet)}]
+							end
+							end, [], AddElems),
+    {ok, {add_all, {AddElems, ToRemove}}};
+generate_downstream({remove, Elem}, Actor, {Clock, _Reset, _Elems, _Entries, _Deferred}) ->
+	NewClock = riak_dt_vclock:increment(Actor, Clock),
+    Dot = {Actor, riak_dt_vclock:get_counter(Actor, NewClock)},
+    {ok, {remove, {Elem, Dot}}};
+generate_downstream({remove_all,RemElems}, Actor, {Clock, _Reset, _Elems, _Entries, _Deferred}) ->
+	[_ | DownstreamOp] = lists:foldl(fun(Elem, [Clk | Sum]) ->
+									case Elem of
+										{ResetClk, reset} ->
+											NewResetClk = case ResetClk of
+															  [current] -> riak_dt_vclock:increment(Actor, Clock);
+															  _ -> ResetClk
+														  end,
+											[Clock] ++ Sum ++ [{NewResetClk, reset}];
+										_ ->
+											NewClock = riak_dt_vclock:increment(Actor, Clk),
+											Dot = {Actor, riak_dt_vclock:get_counter(Actor, NewClock)},
+											[NewClock] ++ Sum ++ [Dot]
+									end
+								end, [Clock], RemElems),
+    {ok, {remove_all, {RemElems, DownstreamOp}}};
+generate_downstream({reset, ResetClk}, Actor, {Clock, _R, Elems, _En, _D}) ->
+	NewResetClk = case ResetClk of
+					  [current] -> riak_dt_vclock:increment(Actor, Clock);
+					  _ -> ResetClk
+				  end,
+	{ok, {reset, {NewResetClk, Elems}}}.
 
 -include_lib("riak_dt/include/riak_dt_tags.hrl").
 -define(TAG, ?DT_ORSWOT_TAG).
@@ -571,11 +662,11 @@ generate_downstream({reset, ResetClk}, Actor, _ORSet) ->
 -define(V2_VERS, 2).
 
 %% @doc returns a binary representation of the provided
-%% `orswot()'. The resulting binary is tagged and versioned for ease
-%% of future upgrade. Calling `from_binary/1' with the result of this
+%% 'orswot()'. The resulting binary is tagged and versioned for ease
+%% of future upgrade. Calling 'from_binary/1' with the result of this
 %% function will return the original set. Use the application env var
-%% `binary_compression' to turn t2b compression on (`true') and off
-%% (`false')
+%% 'binary_compression' to turn t2b compression on ('true') and off
+%% ('false')
 %%
 %% @see from_binary/1
 -spec to_binary(orswot()) -> binary_orswot().
@@ -602,29 +693,29 @@ to_version(_, Set) -> Set.
 
 %% @private transpose a v1 orswot (orddicts) to a v2 (dicts)
 -spec to_v2(any_orswot()) -> orswot().
-to_v2({Clock, Reset, Entries0, Deferred0}) when is_list(Entries0),
+to_v2({Clock, Reset, Elems, Entries0, Deferred0}) when is_list(Entries0),
                                          is_list(Deferred0) ->
     %% Turn v1 set into a v2 set
     Entries = ?DICT:from_list(Entries0),
     Deferred = ?DICT:from_list(Deferred0),
-    {Clock, Reset, Entries, Deferred};
+    {Clock, Reset, Elems, Entries, Deferred};
 to_v2(S) ->
     S.
 
 %% @private transpose a v2 orswot (dicts) to a v1 (orddicts)
 -spec to_v1(any_orswot()) -> v2ord_orswot().
-to_v1({_Clock, _Reset, Entries0, Deferred0}=S) when is_list(Entries0),
+to_v1({_Clock, _Reset, _Elems, Entries0, Deferred0}=S) when is_list(Entries0),
                                             is_list(Deferred0) ->
     S;
-to_v1({Clock, Reset, Entries0, Deferred0}) ->
+to_v1({Clock, Reset, Elems, Entries0, Deferred0}) ->
     %% Must be dicts, there is no is_dict test though
     %% should we use error handling as logic here??
     Entries = riak_dt:dict_to_orddict(Entries0),
     Deferred = riak_dt:dict_to_orddict(Deferred0),
-    {Clock, Reset, Entries, Deferred}.
+    {Clock, Reset, Elems, Entries, Deferred}.
 
-%% @doc When the argument is a `binary_orswot()' produced by
-%% `to_binary/1' will return the original `orswot()'.
+%% @doc When the argument is a 'binary_orswot()' produced by
+%% 'to_binary/1' will return the original 'orswot()'.
 %%
 
 %% @see to_binary/1
@@ -641,7 +732,7 @@ from_binary(_B) ->
     ?INVALID_BINARY.
 
 is_operation(Operation) ->
-    case Operation of
+	case Operation of
 		{reset, Clk} -> is_list(Clk);
 		_ -> riak_dt_orset:is_operation(Operation)
 	end.
@@ -653,16 +744,16 @@ is_operation(Operation) ->
 
 add_test() ->
     Set1 = new(),
-    {ok, DownstreamOp1} = generate_downstream({add, <<"foo">>}, x, Set1),
-    ?assertMatch({add, {<<"foo">>, {x,1}}}, DownstreamOp1),
-    {ok, DownstreamOp2} = generate_downstream({add_all, [<<"li">>,<<"manu">>]}, x, Set1),
-    ?assertMatch({add_all,{[<<"li">>,<<"manu">>],[{x,1}, {x,2}]}}, DownstreamOp2),
+    {ok, DownstreamOp1} = generate_downstream({add, <<"foo">>}, 1, Set1),
+    ?assertMatch({add, {<<"foo">>, {{1,0}, []}}}, DownstreamOp1),
+    {ok, DownstreamOp2} = generate_downstream({add_all, [<<"li">>,<<"manu">>]}, 1, Set1),
+    ?assertMatch({add_all, {[<<"li">>, <<"manu">>], [{{1,0}, []}, {{1,0}, []}]}}, DownstreamOp2),
     {ok, Set2} = update(DownstreamOp1, Set1),
     {_, {Elem1, _}} = DownstreamOp1,
     ?assertEqual([Elem1], value(Set2)),
     {ok, Set3} = update(DownstreamOp2, Set1),
-    {_, {[Elems1, Elems2], [_,_]}} = DownstreamOp2,
-    ?assertEqual([Elems1, Elems2], value(Set3)).
+    {_, {Elems2, _}} = DownstreamOp2,
+    ?assertEqual(Elems2, value(Set3)).
 
 value_test() ->
     Set1 = new(),
@@ -705,36 +796,42 @@ remove_test() ->
     
 concurrent_remove_test() ->
     EmptySet = new(),
-    %% Replicas X, Y and Z start with the empty set
-	XSet1 = EmptySet,
-	YSet1 = EmptySet,
-	ZSet1 = EmptySet,
+    %% Replicas X, Y and Z start with the same element
+    {ok, OpX} = generate_downstream({add, <<"foo">>}, x, EmptySet),
+    {ok, OpY} = generate_downstream({add, <<"foo">>}, y, EmptySet),
+    {ok, OpZ} = generate_downstream({add, <<"foo">>}, z, EmptySet),
+    {ok, XSet1} = update(OpX, EmptySet),
+    ?assertEqual([<<"foo">>], value(XSet1)),
+    {ok, YSet1} = update(OpY, EmptySet),
+    ?assertEqual([<<"foo">>], value(YSet1)),
+    {ok, ZSet1} = update(OpZ, EmptySet),
+    ?assertEqual([<<"foo">>], value(ZSet1)),
     
-    %% Generate downstream for add operation of the element,for replicas X and Y
-    {ok, OpX1} = generate_downstream({add, <<"foo">>}, x, XSet1),
-    {ok, OpY1} = generate_downstream({add, <<"foo">>}, y, YSet1),
-    {ok, XSet2} = update(OpX1, XSet1),
-    ?assertEqual([<<"foo">>], value(XSet2)),
-    {ok, YSet2} = update(OpY1, YSet1),
-    ?assertEqual([<<"foo">>], value(YSet2)),
+    %% Generate downstream for remove operation of the element,for replicas X and Y
+    {ok, OpX2} = generate_downstream({remove, <<"foo">>}, x, XSet1),
+    {ok, OpY2} = generate_downstream({remove, <<"foo">>}, y, YSet1),
+    {ok, XSet2} = update(OpX2, XSet1),
+    ?assertEqual([], value(XSet2)),
+    {ok, YSet2} = update(OpY2, YSet1),
+    ?assertEqual([], value(YSet2)),
     
-    %% First test: Z receives X's and Y's add operations
-    {ok, ZSet2} = update(OpY1, ZSet1),
-    {ok, ZSet3} = update(OpX1, ZSet2),
-    ?assertEqual([{x,1},{y,1}], value({tokens, <<"foo">>}, ZSet3)),
+    %% First test: Z receives X's and Y's remove operations
+    {ok, ZSet2} = update(OpX2, ZSet1),
+    {ok, ZSet3} = update(OpY2, ZSet2),
+    ?assertEqual([], value(ZSet3)),
     
-    %% Generate downstream for removing the recently added element in X
-    {ok, OpX2} = generate_downstream({remove, <<"foo">>}, x, XSet2),
-    {ok, XSet3} = update(OpX2, XSet2),
-    ?assertEqual([], value(XSet3)),
+    %% Generate downstream for adding the recently removed element in X
+    {ok, OpX3} = generate_downstream({add, <<"foo">>}, x, XSet2),
+    {ok, XSet3} = update(OpX3, XSet2),
+    ?assertEqual([<<"foo">>], value(XSet3)),
     
-    %% Second test: X receives Y's add operation
-    {ok, XSet4} = update(OpY1, XSet3),
-    ?assertEqual([<<"foo">>], value(XSet4)),
+    %% Second test: X receives Y's remove operation
+    {ok, XSet4} = update(OpY2, XSet3),
+    ?assertEqual([], value(XSet4)),
     
-    %% Third test: Z receives X's remove operation
-    {ok, ZSet4} = update(OpX2, ZSet3),
-    ?assertEqual([{y,1}], value({tokens, <<"foo">>}, ZSet4)).
+    %% Third test: Z receives X's add operation
+    {ok, ZSet4} = update(OpX3, ZSet3),
+    ?assertEqual([], value(ZSet4)).
     
 reset_test() ->
 	EmptySet = new(),
@@ -748,7 +845,7 @@ reset_test() ->
 		
 	%% Apply reset in X
 	{ok, OpX2} = generate_downstream({reset, [{x,2}, {y,2}]}, x, XSet1),
-	?assertEqual({reset, {[{x,2}, {y,2}], x}}, OpX2),
+	?assertEqual({reset, {[{x,2}, {y,2}], [<<"foo">>]}}, OpX2),
 	{ok, XSet2} = update(OpX2, XSet1),
 	?assertEqual([], value(XSet2)),
 	%% Trying to insert something below the clock
@@ -758,7 +855,8 @@ reset_test() ->
 	%% Downstream test: Y receives X's reset operation
 	{ok, YSet2} = update(OpX2, YSet1),
 	?assertEqual([], value(YSet2)).
-
+	
+%% ORSWOT Tests
 stat_test() ->
     Set = new(),
     {ok, Set1} = update({add, <<"foo">>}, 1, Set),
@@ -768,7 +866,7 @@ stat_test() ->
     ?assertEqual([{actor_count, 0}, {element_count, 0},
                   {max_dot_length, 0}, {deferred_length, 0}],
                  stats(Set)),
-    ?assertEqual(3, stat(actor_count, Set4)),
+    ?assertEqual(1, stat(actor_count, Set4)),
     ?assertEqual(1, stat(element_count, Set4)),
     ?assertEqual(1, stat(max_dot_length, Set4)),
     ?assertEqual(undefined, stat(waste_pct, Set4)).
@@ -859,7 +957,7 @@ batch_order_test() ->
     {ok, Set} = update({add_all, [<<"bar">>, <<"baz">>]}, a, new()),
     Context  = precondition_context(Set),
     {ok, Set2} = update({update, [{remove, <<"baz">>}, {add, <<"baz">>}]}, a, Set, Context),
-    ?assertEqual([<<"bar">>, <<"baz">>], value(Set2)),
+    ?assertEqual([<<"bar">>], value(Set2)),
     {ok, Set3} = update({update, [{remove, <<"baz">>}, {add, <<"baz">>}]}, a, Set),
     ?assertEqual([<<"bar">>, <<"baz">>], value(Set3)),
     {ok, Set4} = update({remove, <<"baz">>}, a, Set),
